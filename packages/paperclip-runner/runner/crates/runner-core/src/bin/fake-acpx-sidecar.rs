@@ -68,6 +68,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut session_identity = Value::Null;
     let mut source_run = String::new();
     let mut source_pending_completion: Option<String> = None;
+    let mut source_goal_revision = 0_u64;
     let mut source_journal = if mode == "source-reconcile" {
         let path = args
             .windows(2)
@@ -122,6 +123,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "turnId":if fault == "active" {json!("unexpected-turn")} else {json!(source_pending_completion)},
                     "pendingToolCount":if fault == "tool" || source_pending_completion.is_some() {1} else {0}, "pendingInputCount":0,
                     "pendingRuntimeRequests":[]});
+            }
+            if command == "session.goal.get" {
+                source_goal_revision += 1;
+                response["result"]["providerRevision"] = json!(source_goal_revision);
+            }
+            if command == "session.snapshot" && fault == "goal-during-snapshot" {
+                source_goal_revision += 1;
+                let frame = json!({
+                    "protocolVersion":GENERATED_ACPX_SIDECAR_PROTOCOL_VERSION,
+                    "sequence":next_sequence,"eventType":"runtime.goal","runId":source_run,"turnId":null,
+                    "payload":{"schema":"paperclip.session_goal.snapshot.v1","providerRevision":source_goal_revision,
+                        "goal":{"objective":"Changed during final status","status":"active","workingNow":false},"workingNow":false}
+                });
+                write_json(journal, &json!({"emitted":frame}))?;
+                write_json(&mut stdout, &frame)?;
+                next_sequence += 1;
             }
             if command == "session.goal.get" && matches!(fault.as_str(), "goal" | "paused") {
                 response["result"]["goal"] = json!({"objective":"Continue independently", "status":if fault == "goal" {"active"} else {"paused"},

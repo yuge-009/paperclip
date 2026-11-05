@@ -437,6 +437,7 @@ impl AcpxProviderSession {
             ));
         }
         let goal = self.goal_control(GeneratedAcpxSidecarCommand::SessionGoalGet, json!({}))?;
+        let prior_events = self.transport.buffered_events().len();
         if !goal_is_dormant(&goal) {
             return Err(LocalRunnerError::invalid(
                 "saved dormant ACPX resumed an active or unknown goal",
@@ -461,6 +462,20 @@ impl AcpxProviderSession {
             return Err(LocalRunnerError::invalid(
                 "saved dormant ACPX snapshot has unexpected work or identity",
             ));
+        }
+        // The status barrier can queue a newer goal while the snapshot is in flight.
+        // Inspect without consuming facts that ordinary polling still owns.
+        let mut checked_state = self.state.clone();
+        for event in self.transport.buffered_events().skip(prior_events) {
+            if event.event_type != GeneratedAcpxSidecarEventType::RuntimeGoal {
+                continue;
+            }
+            checked_state.accept_event(event)?;
+            if !goal_is_dormant(&event.payload) {
+                return Err(LocalRunnerError::invalid(
+                    "saved dormant ACPX received an active or unknown goal during its snapshot",
+                ));
+            }
         }
         Ok(())
     }
@@ -2040,6 +2055,180 @@ mod mode_tests {
             grok_effort: None,
             grok_disable_web_search: None,
             provider_lifetime_fence_candidates: [60_001, 60_002, 60_003],
+        }
+    }
+
+    #[cfg(unix)]
+    fn snapshot_wire_session(
+        prior_events: &[crate::acpx_sidecar_transport::AcpxSidecarEvent],
+        new_events: &[crate::acpx_sidecar_transport::AcpxSidecarEvent],
+        foreign_session: bool,
+    ) -> AcpxProviderSession {
+        let mut cfg = config();
+        let identity = identity();
+        let mut snapshot_identity = identity.clone();
+        if foreign_session {
+            snapshot_identity.acpx_record_id = "foreign-record".to_owned();
+        }
+        let reply = |id, result| {
+            json!({"protocolVersion":GENERATED_ACPX_SIDECAR_PROTOCOL_VERSION,
+            "id":id,"ok":true,"result":result})
+        };
+        let print = |value: Value| {
+            format!(
+                "printf '%s\\n' '{}'\n",
+                value.to_string().replace('\'', "'\"'\"'")
+            )
+        };
+        let mut script = String::new();
+        for (id, events, result) in [
+            (
+                1,
+                prior_events,
+                json!({"schema":"paperclip.session_goal.snapshot.v1","providerRevision":2,"goal":null,"workingNow":false}),
+            ),
+            (
+                2,
+                new_events,
+                json!({"identity":snapshot_identity,"runId":"run-1","turnId":null,
+                "pendingToolCount":0,"pendingInputCount":0,"pendingRuntimeRequests":[]}),
+            ),
+            (3, &[][..], json!({"closed":true})),
+        ] {
+            script.push_str("IFS= read -r request_line\n");
+            for event in events {
+                let event_type = match event.event_type {
+                    GeneratedAcpxSidecarEventType::RuntimeGoal => "runtime.goal",
+                    GeneratedAcpxSidecarEventType::RuntimeDiagnostic => "runtime.diagnostic",
+                    _ => panic!("unsupported fixture event"),
+                };
+                script.push_str(&print(
+                    json!({"protocolVersion":GENERATED_ACPX_SIDECAR_PROTOCOL_VERSION,
+                    "sequence":event.sequence,"eventType":event_type,"runId":event.run_id,
+                    "turnId":event.turn_id,"payload":event.payload}),
+                ));
+            }
+            script.push_str(&print(reply(id, result)));
+        }
+        cfg.transport.command = PathBuf::from("/bin/sh");
+        cfg.transport.args = vec!["-c".to_owned(), script];
+        let transport = AcpxSidecarTransport::start_for_agent(&cfg.transport, &cfg.agent).unwrap();
+        AcpxProviderSession {
+            transport,
+            state: AcpxProviderState::new(&cfg.run_id).unwrap(),
+            identity,
+            tool_bridge: ProviderToolBridge::default(),
+            reserved_tool_bridge: ProviderToolBridge::default(),
+            turn_controls: AcpxTurnControlCapabilities::default(),
+            catalog_revision: cfg.catalog_revision,
+            working_directory: cfg.working_directory.clone(),
+            config: cfg,
+            closed: false,
+            failure: None,
+            transport_terminated: false,
+            runtime_retired: false,
+        }
+    }
+
+    #[cfg(unix)]
+    fn wire_goal(
+        sequence: u64,
+        revision: Option<u64>,
+        status: &str,
+    ) -> crate::acpx_sidecar_transport::AcpxSidecarEvent {
+        crate::acpx_sidecar_transport::AcpxSidecarEvent {
+            sequence,
+            event_type: GeneratedAcpxSidecarEventType::RuntimeGoal,
+            run_id: Some("run-1".to_owned()),
+            turn_id: None,
+            payload: json!({"schema":"paperclip.session_goal.snapshot.v1","providerRevision":revision,
+                "goal":{"status":status,"workingNow":false},"workingNow":false}),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dormant_snapshot_rejects_new_active_goals_regardless_of_revision() {
+        for (revision, status) in [
+            (Some(3), "active"),
+            (Some(2), "active"),
+            (Some(1), "active"),
+            (None, "active"),
+            (Some(3), "unknown"),
+        ] {
+            let events = vec![wire_goal(1, revision, status)];
+            let mut session = snapshot_wire_session(&[], &events, false);
+            let error = session.verify_dormant_session().unwrap_err();
+            assert!(error.to_string().contains("during its snapshot"), "{error}");
+            assert_eq!(
+                session
+                    .transport
+                    .buffered_events()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                events
+            );
+            session.shutdown("test complete").unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dormant_snapshot_preserves_prior_and_benign_new_events_for_polling() {
+        let events = vec![
+            crate::acpx_sidecar_transport::AcpxSidecarEvent {
+                sequence: 1,
+                event_type: GeneratedAcpxSidecarEventType::RuntimeDiagnostic,
+                run_id: Some("run-1".to_owned()),
+                turn_id: None,
+                payload: json!({"code":"probe-observation","message":"Retained observation"}),
+            },
+            wire_goal(2, Some(1), "active"),
+            wire_goal(3, Some(3), "paused"),
+        ];
+        let mut session = snapshot_wire_session(&events[..2], &events[2..], false);
+        session.verify_dormant_session().unwrap();
+        assert_eq!(
+            session
+                .transport
+                .buffered_events()
+                .cloned()
+                .collect::<Vec<_>>(),
+            events
+        );
+        for expected in &events {
+            let delivered = session.poll_event(Duration::ZERO).unwrap().unwrap();
+            if expected.event_type == GeneratedAcpxSidecarEventType::RuntimeGoal {
+                assert!(
+                    matches!(&delivered[..], [AcpxProviderStateEvent::Goal(goal)] if goal == &expected.payload)
+                );
+            } else {
+                assert_eq!(delivered.len(), 1);
+            }
+        }
+        assert!(session.poll_event(Duration::ZERO).unwrap().is_none());
+        session.shutdown("test complete").unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dormant_snapshot_requires_the_same_run_and_session() {
+        for foreign_session in [false, true] {
+            let mut event = wire_goal(1, Some(3), "paused");
+            if !foreign_session {
+                event.run_id = Some("foreign-run".to_owned());
+            }
+            let mut session = snapshot_wire_session(&[], &[event], foreign_session);
+            let error = session.verify_dormant_session().unwrap_err();
+            assert!(
+                error.to_string().contains(if foreign_session {
+                    "identity"
+                } else {
+                    "stale run"
+                }),
+                "{error}"
+            );
+            session.shutdown("test complete").unwrap();
         }
     }
     #[test]

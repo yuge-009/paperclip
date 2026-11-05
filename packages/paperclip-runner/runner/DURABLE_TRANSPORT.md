@@ -110,7 +110,9 @@ process retirement; paired provider qualification remains necessary.
 Qualified ACPX providers advertise the separate `acpxRecoveryIntegrityVersion: 1`
 attestation. They use the same ordinary recovery observation and owner admission.
 Live checks compare the restored session identity, requests, turn and goal with
-saved dormant state. New predecessor admission excludes prepared provider state;
+saved dormant state. Goal updates buffered during the final status read are
+checked after the authoritative goal reply without consuming prior observations
+or other queued events. New predecessor admission excludes prepared provider state;
 ordinary prepared cleanup and the existing suspended-session recovery remain
 unchanged.
 The selected host driver must separately attest `acpxSourceRecoveryVersion: 1`;

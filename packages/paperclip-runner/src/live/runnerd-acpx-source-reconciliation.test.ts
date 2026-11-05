@@ -225,7 +225,7 @@ it.skipIf(process.platform === "win32").each(["codex", "claude", "adopt", "pause
   } finally { await f.cleanup(); }
 }, 30_000);
 
-it.skipIf(process.platform === "win32").each(["goal", "active", "tool"] as const)("stops the owned ACPX process group after live %s admission fails", async fault => {
+it.skipIf(process.platform === "win32").each(["goal", "active", "tool", "goal-during-snapshot"] as const)("stops the owned ACPX process group after live %s admission fails", async fault => {
   const f = await fixture();
   try {
     await writeFile(f.fault, fault);
@@ -236,6 +236,10 @@ it.skipIf(process.platform === "win32").each(["goal", "active", "tool"] as const
       for (const entry of calls) if (entry.processStart || entry.childPid) expect(stopped(entry.processStart ?? entry.childPid)).toBe(true);
     }, { timeout: 5_000 });
     expect(await f.count("processStart")).toBe(2); expect(await f.count("turn.start")).toBe(1);
+    if (fault === "goal-during-snapshot") {
+      expect((await f.calls()).find(entry => entry.emitted?.eventType === "runtime.goal")?.emitted)
+        .toMatchObject({ runId: f.identity.runId, turnId: null, payload: { providerRevision: 2, goal: { status: "active" } } });
+    }
   } finally { await f.cleanup(); }
 }, 30_000);
 
